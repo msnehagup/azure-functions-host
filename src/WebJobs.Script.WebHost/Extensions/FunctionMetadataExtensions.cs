@@ -20,16 +20,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Extensions
         /// Maps FunctionMetadata to FunctionMetadataResponse.
         /// </summary>
         /// <param name="functionMetadata">FunctionMetadata to be mapped.</param>
-        /// <param name="request">Current HttpRequest</param>
         /// <param name="hostOptions">The host options</param>
         /// <returns>Promise of a FunctionMetadataResponse</returns>
-        public static async Task<FunctionMetadataResponse> ToFunctionMetadataResponse(this FunctionMetadata functionMetadata, HttpRequest request, ScriptJobHostOptions hostOptions, string routePrefix)
+        public static async Task<FunctionMetadataResponse> ToFunctionMetadataResponse(this FunctionMetadata functionMetadata, ScriptJobHostOptions hostOptions, string routePrefix, string baseUrl)
         {
             var functionPath = Path.Combine(hostOptions.RootScriptPath, functionMetadata.Name);
             var functionMetadataFilePath = Path.Combine(functionPath, ScriptConstants.FunctionMetadataFileName);
-            var baseUrl = request != null
-                ? $"{request.Scheme}://{request.Host}"
-                : "https://localhost/";
+            if (string.IsNullOrEmpty(baseUrl))
+            {
+                baseUrl = "https://localhost/";
+            }
 
             var response = new FunctionMetadataResponse
             {
@@ -51,7 +51,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Extensions
             {
                 var testDataFilePath = functionMetadata.GetTestDataFilePath(hostOptions);
                 response.TestDataHref = VirtualFileSystem.FilePathToVfsUri(testDataFilePath, baseUrl, hostOptions);
-                response.TestData = await GetTestData(testDataFilePath, hostOptions);
+
+                // why are we reading this and returning it? we should just be returning
+                // the href like all the other file paths
+                // also, we can't cache this in the functions digest either
+                //response.TestData = await GetTestData(testDataFilePath, hostOptions);
             }
 
             if (!string.IsNullOrEmpty(functionMetadata.ScriptFile))

@@ -14,9 +14,12 @@ using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Extensions.Options;
 using Moq;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
@@ -25,16 +28,26 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
     {
         private readonly string _testRootScriptPath;
         private readonly string _testHostConfigFilePath;
+        private readonly ScriptApplicationHostOptions _hostOptions;
 
         public WebFunctionsManagerTests()
         {
             _testRootScriptPath = Path.GetTempPath();
             _testHostConfigFilePath = Path.Combine(_testRootScriptPath, ScriptConstants.HostMetadataFileName);
             FileUtility.DeleteFileSafe(_testHostConfigFilePath);
+
+            _hostOptions = new ScriptApplicationHostOptions
+            {
+                ScriptPath = @"x:\root",
+                IsSelfHost = false,
+                LogPath = @"x:\tmp\log",
+                SecretsPath = @"x:\secrets",
+                TestDataPath = @"x:\test"
+            };
         }
 
         [Fact]
-        public async Task VerifyDurableTaskHubNameIsAdded()
+        public async Task VerifySyncTriggersContent()
         {
             var vars = new Dictionary<string, string>
             {
@@ -44,30 +57,77 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             using (var env = new TestScopedEnvironmentVariable(vars))
             {
                 // Setup
-                const string expectedSyncTriggersPayload = "[{\"authLevel\":\"anonymous\",\"type\":\"httpTrigger\",\"direction\":\"in\",\"name\":\"req\",\"functionName\":\"function1\"}," +
-                "{\"name\":\"myQueueItem\",\"type\":\"orchestrationTrigger\",\"direction\":\"in\",\"queueName\":\"myqueue-items\",\"connection\":\"DurableStorage\",\"functionName\":\"function2\",\"taskHubName\":\"TestHubValue\"}," +
-                "{\"name\":\"myQueueItem\",\"type\":\"activityTrigger\",\"direction\":\"in\",\"queueName\":\"myqueue-items\",\"connection\":\"DurableStorage\",\"functionName\":\"function3\",\"taskHubName\":\"TestHubValue\"}]";
-                var options = CreateApplicationHostOptions();
-                var fileSystem = CreateFileSystem(options.ScriptPath);
+                var fileSystem = CreateFileSystem(_hostOptions.ScriptPath);
                 var loggerFactory = MockNullLogerFactory.CreateLoggerFactory();
                 var contentBuilder = new StringBuilder();
                 var httpClient = CreateHttpClient(contentBuilder);
-                var factory = new TestOptionsFactory<ScriptApplicationHostOptions>(options);
+                var factory = new TestOptionsFactory<ScriptApplicationHostOptions>(_hostOptions);
                 var tokenSource = new TestChangeTokenSource();
                 var changeTokens = new[] { tokenSource };
                 var optionsMonitor = new OptionsMonitor<ScriptApplicationHostOptions>(factory, changeTokens, factory);
-                var webManager = new WebFunctionsManager(optionsMonitor, new OptionsWrapper<LanguageWorkerOptions>(CreateLanguageWorkerConfigSettings()), loggerFactory, httpClient);
+                var secretManagerProviderMock = new Mock<ISecretManagerProvider>(MockBehavior.Strict);
+                var secretManagerMock = new Mock<ISecretManager>(MockBehavior.Strict);
+                secretManagerProviderMock.SetupGet(p => p.Current).Returns(secretManagerMock.Object);
+                var hostSecretsInfo = new HostSecretsInfo();
+                hostSecretsInfo.MasterKey = "aaa";
+                hostSecretsInfo.FunctionKeys = new Dictionary<string, string>
+                {
+                    { "TestHostFunctionKey1", "aaa" },
+                    { "TestHostFunctionKey2", "bbb" }
+                };
+                hostSecretsInfo.SystemKeys = new Dictionary<string, string>
+                {
+                    { "TestSystemKey1", "aaa" },
+                    { "TestSystemKey2", "bbb" }
+                };
+                secretManagerMock.Setup(p => p.GetHostSecretsAsync()).ReturnsAsync(hostSecretsInfo);
+                Dictionary<string, string> functionSecretsResponse = new Dictionary<string, string>()
+                {
+                    { "TestFunctionKey1", "aaa" },
+                    { "TestFunctionKey2", "bbb" }
+                };
+                secretManagerMock.Setup(p => p.GetFunctionSecretsAsync("function1", false)).ReturnsAsync(functionSecretsResponse);
+
+                var functionsSyncManager = new FunctionsSyncManager(optionsMonitor, new OptionsWrapper<LanguageWorkerOptions>(CreateLanguageWorkerConfigSettings()), loggerFactory, httpClient, secretManagerProviderMock.Object);
 
                 FileUtility.Instance = fileSystem;
 
                 // Act
-                (var success, var error) = await webManager.TrySyncTriggers();
-                var content = contentBuilder.ToString();
+                (var success, var error) = await functionsSyncManager.TrySyncTriggersAsync();
+                var result = JObject.Parse(contentBuilder.ToString());
 
                 // Assert
                 Assert.True(success, "SyncTriggers should return success true");
                 Assert.True(string.IsNullOrEmpty(error), "Error should be null or empty");
-                Assert.Equal(expectedSyncTriggersPayload, content);
+
+                // verify triggers
+                const string expectedSyncTriggersPayload = "[{\"authLevel\":\"anonymous\",\"type\":\"httpTrigger\",\"direction\":\"in\",\"name\":\"req\",\"functionName\":\"function1\"}," +
+                "{\"name\":\"myQueueItem\",\"type\":\"orchestrationTrigger\",\"direction\":\"in\",\"queueName\":\"myqueue-items\",\"connection\":\"DurableStorage\",\"functionName\":\"function2\",\"taskHubName\":\"TestHubValue\"}," +
+                "{\"name\":\"myQueueItem\",\"type\":\"activityTrigger\",\"direction\":\"in\",\"queueName\":\"myqueue-items\",\"connection\":\"DurableStorage\",\"functionName\":\"function3\",\"taskHubName\":\"TestHubValue\"}]";
+                var triggers = result["triggers"];
+                Assert.Equal(expectedSyncTriggersPayload, triggers.ToString(Formatting.None));
+
+                // verify functions
+                var functions = (JArray)result["functions"];
+                Assert.Equal(3, functions.Count);
+
+                // verify secrets
+                var secrets = (JObject)result["secrets"];
+                var hostSecrets = (JObject)secrets["host"];
+                Assert.Equal("aaa", (string)hostSecrets["master"]);
+                var hostFunctionSecrets = (JObject)hostSecrets["function"];
+                Assert.Equal("aaa", (string)hostFunctionSecrets["TestHostFunctionKey1"]);
+                Assert.Equal("bbb", (string)hostFunctionSecrets["TestHostFunctionKey2"]);
+                var systemSecrets = (JObject)hostSecrets["system"];
+                Assert.Equal("aaa", (string)systemSecrets["TestSystemKey1"]);
+                Assert.Equal("bbb", (string)systemSecrets["TestSystemKey2"]);
+
+                var functionSecrets = (JArray)secrets["function"];
+                Assert.Equal(1, functionSecrets.Count);
+                var function1Secrets = (JObject)functionSecrets[0];
+                Assert.Equal("function1", function1Secrets["name"]);
+                Assert.Equal("aaa", (string)function1Secrets["secrets"]["TestFunctionKey1"]);
+                Assert.Equal("bbb", (string)function1Secrets["secrets"]["TestFunctionKey2"]);
             }
         }
 
@@ -84,27 +144,35 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 
             using (var env = new TestScopedEnvironmentVariable(vars))
             {
-                var httpRequest = WebFunctionsManager.BuildSyncTriggersRequest();
+                var httpRequest = FunctionsSyncManager.BuildSetTriggersRequest();
                 Assert.Equal(syncTriggersUri, httpRequest.RequestUri.AbsoluteUri);
                 Assert.Equal(HttpMethod.Post, httpRequest.Method);
             }
         }
 
         [Fact]
-        public static void ReadFunctionsMetadataSucceeds()
+        public void ReadFunctionsMetadataSucceeds()
         {
             string functionsPath = Path.Combine(Environment.CurrentDirectory, @"..\..\..\..\..\sample");
             // Setup
-            var options = CreateApplicationHostOptions();
-            var fileSystem = CreateFileSystem(options.ScriptPath);
+            var fileSystem = CreateFileSystem(_hostOptions.ScriptPath);
             var loggerFactory = MockNullLogerFactory.CreateLoggerFactory();
             var contentBuilder = new StringBuilder();
             var httpClient = CreateHttpClient(contentBuilder);
-            var factory = new TestOptionsFactory<ScriptApplicationHostOptions>(options);
+            var factory = new TestOptionsFactory<ScriptApplicationHostOptions>(_hostOptions);
             var tokenSource = new TestChangeTokenSource();
             var changeTokens = new[] { tokenSource };
             var optionsMonitor = new OptionsMonitor<ScriptApplicationHostOptions>(factory, changeTokens, factory);
-            var webManager = new WebFunctionsManager(optionsMonitor, new OptionsWrapper<LanguageWorkerOptions>(CreateLanguageWorkerConfigSettings()), loggerFactory, httpClient);
+            var secretManagerProviderMock = new Mock<ISecretManagerProvider>(MockBehavior.Strict);
+            var secretManagerMock = new Mock<ISecretManager>(MockBehavior.Strict);
+            secretManagerProviderMock.SetupGet(p => p.Current).Returns(secretManagerMock.Object);
+            var hostSecretsInfo = new HostSecretsInfo();
+            secretManagerMock.Setup(p => p.GetHostSecretsAsync()).ReturnsAsync(hostSecretsInfo);
+            Dictionary<string, string> functionSecrets = new Dictionary<string, string>();
+            secretManagerMock.Setup(p => p.GetFunctionSecretsAsync("httptrigger", false)).ReturnsAsync(functionSecrets);
+
+            var functionsSyncManager = new FunctionsSyncManager(optionsMonitor, new OptionsWrapper<LanguageWorkerOptions>(CreateLanguageWorkerConfigSettings()), loggerFactory, httpClient, secretManagerProviderMock.Object);
+            var webManager = new WebFunctionsManager(optionsMonitor, new OptionsWrapper<LanguageWorkerOptions>(CreateLanguageWorkerConfigSettings()), loggerFactory, httpClient, secretManagerProviderMock.Object, functionsSyncManager);
 
             FileUtility.Instance = fileSystem;
             IEnumerable<FunctionMetadata> metadata = webManager.GetFunctionsMetadata();
@@ -137,18 +205,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         private static HttpClient CreateHttpClient(StringBuilder writeContent)
         {
             return new HttpClient(new MockHttpHandler(writeContent));
-        }
-
-        private static ScriptApplicationHostOptions CreateApplicationHostOptions()
-        {
-            return new ScriptApplicationHostOptions
-            {
-                ScriptPath = @"x:\root",
-                IsSelfHost = false,
-                LogPath = @"x:\tmp\log",
-                SecretsPath = @"x:\secrets",
-                TestDataPath = @"x:\test"
-            };
         }
 
         private static LanguageWorkerOptions CreateLanguageWorkerConfigSettings()
