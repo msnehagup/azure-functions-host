@@ -45,7 +45,7 @@ namespace Microsoft.Azure.WebJobs.Script.Configuration
             private static readonly string[] WellKnownHostJsonProperties = new[]
             {
                 "version", "functionTimeout", "functions", "http", "watchDirectories", "queues", "serviceBus",
-                "eventHub", "singleton", "logging", "aggregator", "healthMonitor", "extensionBundle"
+                "eventHub", "singleton", "logging", "aggregator", "healthMonitor", "extensionBundle", "origin"
             };
 
             private readonly HostJsonFileConfigurationSource _configurationSource;
@@ -144,6 +144,11 @@ namespace Microsoft.Azure.WebJobs.Script.Configuration
                 // Do not log these until after all the configuration is done so the proper filters are applied.
                 _logger.LogInformation(readingFileMessage);
                 _logger.LogInformation(readFileMessage);
+
+                if (hostConfigObject["origin"] != null)
+                {
+                    _logger.LogInformation($"Origin found:{NewLine}{hostConfigObject["origin"].ToString()}");
+                }
 
                 return hostConfigObject;
             }
