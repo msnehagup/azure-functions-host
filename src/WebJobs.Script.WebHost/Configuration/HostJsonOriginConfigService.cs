@@ -42,7 +42,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Configuration
             return Task.CompletedTask;
         }
 
-        private static JToken GetJsonObject(IConfigurationSection configSection)
+        internal static JToken GetJsonObject(IConfigurationSection configSection)
         {
             if (configSection.GetChildren().Any())
             {
